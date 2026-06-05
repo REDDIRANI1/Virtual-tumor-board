@@ -21,3 +21,8 @@ To commit, run the script from the root directory with your commit message as an
 ```
 
 If you do not provide a commit message, it will default to `"chore: commit by reddirani"`.
+
+<!-- SPECKIT START -->
+For additional context about technologies to be used, project structure,
+shell commands, and other important information, read the current plan
+<!-- SPECKIT END -->
