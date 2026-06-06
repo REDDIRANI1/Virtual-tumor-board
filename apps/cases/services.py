@@ -59,5 +59,23 @@ def transition_case(case_id, expected_version, new_status, actor):
         if updated_rows == 0:
             raise StaleVersionError(f"Stale version for case {case_id}. Expected {expected_version}.")
         
+        old_status = case.status
         case.refresh_from_db()
+        
+        from apps.audit.services import create_audit_event
+        from apps.audit.models import AuditEvent
+        
+        action = AuditEvent.Action.CASE_TRANSITION
+        if new_status == CaseStatus.CLOSED.value:
+            action = AuditEvent.Action.CASE_CLOSED
+        elif new_status == CaseStatus.REJECTED.value:
+            action = AuditEvent.Action.CASE_REJECTED
+            
+        create_audit_event(
+            action=action,
+            actor=actor,
+            case=case,
+            metadata={"from_status": old_status, "to_status": new_status, "version": case.version}
+        )
+        
         return case
