@@ -23,9 +23,9 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt.token_blacklist',
 
     # Local apps
-    # 'apps.accounts',
-    # 'apps.cases',
-    # 'apps.audit',
+    'apps.accounts',
+    'apps.cases',
+    'apps.audit',
 ]
 
 MIDDLEWARE = [
@@ -102,6 +102,7 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
+    'EXCEPTION_HANDLER': 'config.exceptions.custom_exception_handler',
 }
 
 JWT_SIGNING_KEY = os.environ.get('JWT_SIGNING_KEY', SECRET_KEY)
