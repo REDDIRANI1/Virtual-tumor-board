@@ -10,3 +10,7 @@ specs/
 
 # Internal utilities
 commit.sh
+
+# Local agent instructions / AI guidance
+/AGENTS.md
+/agents.md
