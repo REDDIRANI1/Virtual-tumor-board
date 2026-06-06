@@ -79,3 +79,47 @@ def transition_case(case_id, expected_version, new_status, actor):
         )
         
         return case
+
+import json
+from rest_framework.exceptions import PermissionDenied
+
+def structure_case(case_id, expected_version, structured_summary, actor):
+    if actor.role != 'moderator':
+        raise PermissionDenied("Only a moderator can structure cases.")
+        
+    case = Case.objects.filter(id=case_id).first()
+    if not case:
+        raise ValidationError(f"Case {case_id} not found.")
+
+    if case.status != CaseStatus.SUBMITTED.value:
+        raise InvalidTransitionError("Only SUBMITTED cases can be structured.")
+
+    with transaction.atomic():
+        updated_rows = Case.objects.filter(
+            id=case_id,
+            version=expected_version
+        ).update(
+            status=CaseStatus.IN_REVIEW.value,
+            version=F('version') + 1,
+            structured_summary=json.dumps(structured_summary),
+            structured_by=actor,
+            structured_at=timezone.now(),
+            updated_at=timezone.now()
+        )
+
+        if updated_rows == 0:
+            raise StaleVersionError(f"Stale version for case {case_id}. Expected {expected_version}.")
+            
+        case.refresh_from_db()
+        
+        from apps.audit.services import create_audit_event
+        from apps.audit.models import AuditEvent
+        
+        create_audit_event(
+            action=AuditEvent.Action.CASE_STRUCTURED,
+            actor=actor,
+            case=case,
+            metadata={"version": case.version}
+        )
+        
+        return case
