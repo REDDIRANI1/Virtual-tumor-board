@@ -2,10 +2,9 @@
 *.log
 .gemini/
 
-# Agent and Spec tool directories
+# Agent and Spec tool directories (internal tooling, not for review)
 .specify/
 .kiro/
-specs/
 .agents/
 
 # Internal utilities
