@@ -14,3 +14,13 @@ commit.sh
 /AGENTS.md
 /agents.md
 /specs/
+
+# Python / Environment
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+venv/
+.env
+db.sqlite3
+e2e_api_test.py
