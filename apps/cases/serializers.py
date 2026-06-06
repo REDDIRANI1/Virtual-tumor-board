@@ -46,3 +46,40 @@ class CaseDetailSerializer(serializers.ModelSerializer):
 class CaseStructureSerializer(serializers.Serializer):
     structured_summary = serializers.JSONField()
     expected_version = serializers.IntegerField()
+
+from .models import Comment, Invitation
+
+class CommentPeerSerializer(serializers.ModelSerializer):
+    display_name = serializers.CharField(source='get_display_name', read_only=True)
+    
+    class Meta:
+        model = Comment
+        fields = [
+            'id', 'case', 'parent', 'content', 'display_name', 
+            'is_anonymous', 'parent_display_name_snapshot', 
+            'quoted_text_snapshot', 'quoted_display_name_snapshot', 
+            'created_at'
+        ]
+
+class CommentAccountabilitySerializer(CommentPeerSerializer):
+    author = serializers.PrimaryKeyRelatedField(read_only=True)
+    author_username = serializers.CharField(source='author.username', read_only=True)
+    
+    class Meta(CommentPeerSerializer.Meta):
+        fields = CommentPeerSerializer.Meta.fields + ['author', 'author_username']
+
+class CommentCreateSerializer(serializers.Serializer):
+    content = serializers.CharField()
+    parent_id = serializers.UUIDField(required=False, allow_null=True)
+    quoted_comment_id = serializers.UUIDField(required=False, allow_null=True)
+    is_anonymous = serializers.BooleanField(default=False)
+
+class InvitationSerializer(serializers.ModelSerializer):
+    case = CaseListSerializer(read_only=True)
+    
+    class Meta:
+        model = Invitation
+        fields = ['id', 'case', 'status', 'created_at']
+
+class InviteCreateSerializer(serializers.Serializer):
+    doctor_id = serializers.UUIDField()
