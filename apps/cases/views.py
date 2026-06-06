@@ -13,9 +13,12 @@ from .serializers import (
     CommentAccountabilitySerializer,
     CommentCreateSerializer,
     InvitationSerializer,
-    InviteCreateSerializer
+    InviteCreateSerializer,
+    TransitionSerializer,
+    PublishAnswerSerializer,
+    AmendAnswerSerializer
 )
-from .services import structure_case, invite_doctor, create_comment, reveal_comment_identity
+from .services import structure_case, invite_doctor, create_comment, reveal_comment_identity, transition_case, publish_answer, amend_answer
 from apps.accounts.permissions import IsWarrior, IsModerator, IsDoctor
 
 class CaseViewSet(viewsets.ModelViewSet):
@@ -40,12 +43,18 @@ class CaseViewSet(viewsets.ModelViewSet):
             return CaseStructureSerializer
         elif self.action == 'invite_doctor':
             return InviteCreateSerializer
+        elif self.action == 'transition':
+            return TransitionSerializer
+        elif self.action == 'publish_answer':
+            return PublishAnswerSerializer
+        elif self.action == 'amend_answer':
+            return AmendAnswerSerializer
         return CaseDetailSerializer
 
     def get_permissions(self):
         if self.action == 'create':
             return [IsAuthenticated(), IsWarrior()]
-        elif self.action == 'structure' or self.action == 'invite_doctor':
+        elif self.action in ['structure', 'invite_doctor', 'transition', 'publish_answer', 'amend_answer']:
             return [IsAuthenticated(), IsModerator()]
         return super().get_permissions()
 
@@ -79,6 +88,50 @@ class CaseViewSet(viewsets.ModelViewSet):
         )
         
         return Response(InvitationSerializer(invitation).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'])
+    def transition(self, request, pk=None):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        case = transition_case(
+            case_id=pk,
+            expected_version=serializer.validated_data['expected_version'],
+            new_status=serializer.validated_data['new_status'],
+            actor=request.user
+        )
+        return Response(CaseDetailSerializer(case, context={'request': request}).data)
+
+    @action(detail=True, methods=['post'], url_path='publish-answer')
+    def publish_answer(self, request, pk=None):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        answer = publish_answer(
+            case_id=pk,
+            expected_version=serializer.validated_data['expected_version'],
+            content=serializer.validated_data['content'],
+            actor=request.user
+        )
+        # Assuming we just return the full case representation to the client
+        case = Case.objects.get(id=pk)
+        return Response(CaseDetailSerializer(case, context={'request': request}).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'], url_path='amend-answer')
+    def amend_answer(self, request, pk=None):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        amendment = amend_answer(
+            case_id=pk,
+            expected_version=serializer.validated_data['expected_version'],
+            content=serializer.validated_data['content'],
+            reason=serializer.validated_data['reason'],
+            actor=request.user
+        )
+        case = Case.objects.get(id=pk)
+        return Response(CaseDetailSerializer(case, context={'request': request}).data, status=status.HTTP_201_CREATED)
+
 
 class CommentViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]

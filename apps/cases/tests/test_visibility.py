@@ -85,3 +85,23 @@ def test_warrior_viewing_closed_or_rejected_case_safe_view(api_client, warrior):
     assert data['status'] == 'CLOSED'
     assert 'structured_summary' not in data
     assert 'comments' not in data
+
+from apps.cases.tests.factories import PublishedAnswerFactory
+
+def test_warrior_visibility_final_answer(api_client, warrior):
+    case = CaseFactory(status='ANSWERED', warrior=warrior)
+    answer = PublishedAnswerFactory(case=case, content='The final published answer')
+    
+    api_client.force_authenticate(user=warrior)
+    url = reverse('cases:case-detail', kwargs={'pk': case.id})
+    response = api_client.get(url)
+    assert response.status_code == status.HTTP_200_OK
+    
+    data = response.data
+    assert data['status'] == 'ANSWERED'
+    assert 'published_answer' in data
+    assert data['published_answer']['content'] == 'The final published answer'
+    assert 'amendments' in data['published_answer']
+    
+    assert 'structured_summary' not in data
+    assert 'comments' not in data

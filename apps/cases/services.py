@@ -44,6 +44,9 @@ def transition_case(case_id, expected_version, new_status, actor):
     if not case:
         raise ValidationError(f"Case {case_id} not found.")
 
+    if case.version != expected_version:
+        raise StaleVersionError(f"Stale version for case {case_id}. Expected {expected_version}.")
+
     validate_transition(case.status, new_status)
 
     with transaction.atomic():
@@ -90,6 +93,9 @@ def structure_case(case_id, expected_version, structured_summary, actor):
     case = Case.objects.filter(id=case_id).first()
     if not case:
         raise ValidationError(f"Case {case_id} not found.")
+
+    if case.version != expected_version:
+        raise StaleVersionError(f"Stale version for case {case_id}. Expected {expected_version}.")
 
     if case.status != CaseStatus.SUBMITTED.value:
         raise InvalidTransitionError("Only SUBMITTED cases can be structured.")
@@ -255,3 +261,105 @@ def reveal_comment_identity(comment_id, requesting_user):
     )
     
     return comment
+
+def publish_answer(case_id, expected_version, content, actor):
+    if actor.role != 'moderator':
+        raise PermissionDenied("Only a moderator can publish answers.")
+        
+    case = Case.objects.filter(id=case_id).first()
+    if not case:
+        raise ValidationError(f"Case {case_id} not found.")
+
+    if case.version != expected_version:
+        raise StaleVersionError(f"Stale version for case {case_id}. Expected {expected_version}.")
+
+    if case.status != CaseStatus.UNDER_DISCUSSION.value:
+        raise InvalidTransitionError("Only UNDER_DISCUSSION cases can be published.")
+
+    with transaction.atomic():
+        updated_rows = Case.objects.filter(
+            id=case_id,
+            version=expected_version
+        ).update(
+            status=CaseStatus.ANSWERED.value,
+            version=F('version') + 1,
+            updated_at=timezone.now()
+        )
+
+        if updated_rows == 0:
+            raise StaleVersionError(f"Stale version for case {case_id}. Expected {expected_version}.")
+
+        case.refresh_from_db()
+        
+        from .models import PublishedAnswer
+        answer = PublishedAnswer.objects.create(
+            case=case,
+            content=content,
+            published_by=actor
+        )
+        
+        from apps.audit.services import create_audit_event
+        from apps.audit.models import AuditEvent
+        
+        create_audit_event(
+            action=AuditEvent.Action.ANSWER_PUBLISHED,
+            actor=actor,
+            case=case,
+            metadata={"version": case.version}
+        )
+        
+        return answer
+
+def amend_answer(case_id, expected_version, content, reason, actor):
+    if actor.role != 'moderator':
+        raise PermissionDenied("Only a moderator can amend answers.")
+        
+    case = Case.objects.filter(id=case_id).first()
+    if not case:
+        raise ValidationError(f"Case {case_id} not found.")
+
+    if case.version != expected_version:
+        raise StaleVersionError(f"Stale version for case {case_id}. Expected {expected_version}.")
+
+    if case.status != CaseStatus.ANSWERED.value:
+        raise ValidationError("Only ANSWERED cases can be amended.")
+
+    if not hasattr(case, 'published_answer'):
+        raise ValidationError("Case does not have a published answer to amend.")
+
+    with transaction.atomic():
+        updated_rows = Case.objects.filter(
+            id=case_id,
+            version=expected_version
+        ).update(
+            version=F('version') + 1,
+            updated_at=timezone.now()
+        )
+
+        if updated_rows == 0:
+            raise StaleVersionError(f"Stale version for case {case_id}. Expected {expected_version}.")
+
+        case.refresh_from_db()
+        
+        from .models import AmendedAnswer
+        next_version = case.published_answer.amendments.count() + 1
+        
+        amendment = AmendedAnswer.objects.create(
+            published_answer=case.published_answer,
+            version_number=next_version,
+            content=content,
+            reason=reason,
+            amended_by=actor
+        )
+        
+        from apps.audit.services import create_audit_event
+        from apps.audit.models import AuditEvent
+        
+        create_audit_event(
+            action=AuditEvent.Action.ANSWER_AMENDED,
+            actor=actor,
+            case=case,
+            metadata={"version": case.version, "amendment_version": next_version}
+        )
+        
+        return amendment
