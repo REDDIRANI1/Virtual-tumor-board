@@ -2,221 +2,269 @@
 
 ## Architecture Overview
 
-Three Django apps: `accounts`, `cases`, `audit`. That's it.
+The backend is a Django REST Framework project with three main apps:
 
-I went with a **thin-views, thick-services** split. The views do exactly two things — check who you are and parse your HTTP request. Everything else — state transitions, anonymity logic, concurrency checks, audit events — lives in `cases/services.py`. That one file is 366 lines and it's the heart of the whole system.
+- `accounts` — user model, roles and permissions
+- `cases` — case lifecycle, comments, invitations and answers
+- `audit` — audit event records
 
-Why not put logic in models? Because the interesting problems here (concurrency, anonymity snapshots, coordinating audit events with state changes) all span multiple models. A `transition_case()` call touches `Case`, creates an `AuditEvent`, and needs to be wrapped in a single transaction. That doesn't belong in `Case.save()`.
+I kept the structure simple instead of splitting the project into too many small apps. Most of the important business logic is in `apps/cases/services.py`. The views are kept thin: they mainly validate the request, check permissions, and call the service functions.
 
-Why not signals? I considered Django signals for audit logging (post_save, etc.) and rejected them fast. Signals hide control flow. When a reviewer reads `case.save()`, nothing tells them an audit event gets created somewhere else. In a clinical system where "did we log this?" is a regulatory question, implicit behavior is a liability. Every audit event is an explicit `create_audit_event()` call sitting right next to the operation it records.
+The reason for this split is that most operations are not limited to one model. For example, changing a case status also needs a version check and an audit event. Revealing identity on a comment also affects how the comment is displayed. These are not just `model.save()` operations, so I kept them in service functions where they can be wrapped in transactions.
 
-```
+I also avoided Django signals for audit logging. Signals make the flow harder to follow. In this kind of system, I wanted audit events to be visible in the code near the actual operation. So every meaningful write has an explicit audit call.
+
+```text
 config/
-├── settings/          # split: base, dev, test, prod
-├── urls.py            # root router
-└── exceptions.py      # custom handler — sanitizes error bodies
+├── settings/          # base, dev, test, prod
+├── urls.py            # root routes
+└── exceptions.py      # custom error handling and sanitising
 
 apps/
-├── accounts/          # User model (UUID PK + role), 4 permission classes
-├── cases/             # 5 models, services.py (all logic), 12 serializers
-└── audit/             # AuditEvent (append-only), read-only API
+├── accounts/          # user model, roles, permissions
+├── cases/             # case models, serializers, services, views
+└── audit/             # append-only audit event model and API
 ```
 
 ## Data Model
 
-Seven tables. I'll focus on the non-obvious choices.
+The main tables are `User`, `Case`, `Invitation`, `Comment`, `PublishedAnswer`, `AmendedAnswer`, and `AuditEvent`.
 
-**Case** — The `version` field is the one that matters. Every state-changing operation sends an `expected_version` and the DB does an atomic compare-and-swap: `UPDATE ... WHERE version = expected AND id = ... SET version = version + 1`. If the row count is zero, someone else got there first. More on this under Concurrency below.
+### Case
 
-The `structured_summary` is a TextField storing JSON, not a JSONField. I did this because the structure of the clinical summary isn't fixed — different moderators might include different sections — and I didn't want to define a rigid schema that would need migrations every time the format changed. The serializer parses it on read.
+`Case` stores the current status and a `version` field. The version is used for optimistic locking. Any state-changing API call must send the expected version. If the version in the database has already changed, the update fails with a stale version error.
 
-**Comment** — Three snapshot fields: `parent_display_name_snapshot`, `quoted_text_snapshot`, `quoted_display_name_snapshot`. These get frozen at creation time and never updated. This is the core of my anonymity reveal solution (explained below). The `anonymous_number` is stable per-author-per-case — if the same doctor posts anonymously twice in one case, they keep the same number.
+`structured_summary` is stored as text containing JSON. I used this instead of a strict schema because the exact sections of a clinical summary can vary. The serializer parses it when returning the response.
 
-**PublishedAnswer** vs **AmendedAnswer** — I split these into two models instead of versioning a single model. The published answer is immutable (enforced by a `save()` override that raises on updates). Amendments are separate records with a mandatory `reason` field and auto-incrementing `version_number`. This means the original clinical record is never altered — you can always see exactly what was published and what was changed later.
+### Comment
 
-**AuditEvent** — Append-only. The `save()` method raises `NotImplementedError` on updates. The `delete()` method raises too. The admin is registered as read-only. I went this far because in a clinical context, a "modifiable audit trail" is an oxymoron.
+Comments support anonymous posting. The important fields are:
 
-```
-┌──────────┐      ┌──────────────┐     ┌───────────────────┐
-│  User    │──1:N──│   Case       │──1:N─│   Comment         │
-│ (UUID PK)│      │ (version,    │     │ (is_anonymous,    │
-│ (role)   │      │  status)     │     │  anonymous_number,│
-└──────────┘      └──────┬───────┘     │  is_revealed,     │
-      │                  │             │  3 snapshot fields)│
-      │           ┌──────┴───────┐     └───────────────────┘
-      │           │ Invitation   │
-      │           │ (auto-accept)│     ┌───────────────────┐
-      │           │ UC(case,doc) │     │ PublishedAnswer    │
-      │           └──────────────┘     │ (immutable save()) │
-      │                                │ 1:1 → Case        │
-      │           ┌────────────────┐   └───────┬───────────┘
-      └───────────│  AuditEvent    │           │
-                  │ (append-only)  │   ┌───────┴───────────┐
-                  │ (9 action types│   │ AmendedAnswer      │
-                  │  + metadata)   │   │ (version_number,   │
-                  └────────────────┘   │  reason)           │
-                                       └───────────────────┘
+- `is_anonymous`
+- `anonymous_number`
+- `is_revealed`
+- `parent_display_name_snapshot`
+- `quoted_text_snapshot`
+- `quoted_display_name_snapshot`
+
+The snapshot fields are intentional. When a doctor replies to or quotes an anonymous comment, the display name at that time is saved as a string. If the original author later reveals their identity, older replies do not automatically change.
+
+The anonymous number is stable per doctor per case. So if the same doctor posts multiple anonymous comments in one case, they remain the same anonymous doctor number.
+
+### PublishedAnswer and AmendedAnswer
+
+I kept the original published answer separate from amendments.
+
+`PublishedAnswer` is immutable after creation. The model blocks updates through `save()`. If a correction is needed later, it goes into `AmendedAnswer` with a version number and a required reason.
+
+This keeps the original clinical answer intact and makes amendments easier to inspect.
+
+### AuditEvent
+
+`AuditEvent` is append-only. Updates and deletes are blocked in the model. The admin view is also read-only.
+
+The goal is not to log everything, but to log clinically meaningful actions like status changes, comments, answer publishing, amendments, and identity reveal.
+
+```text
+User
+ ├── Case
+ │    ├── Comment
+ │    ├── Invitation
+ │    ├── PublishedAnswer
+ │    └── AmendedAnswer
+ └── AuditEvent
 ```
 
 ## State Machine
 
+The case statuses move like this:
+
+```text
+SUBMITTED ── structure case ──> IN_REVIEW ── transition ──> UNDER_DISCUSSION
+    │                              │                              │
+    ├── CLOSED                     ├── CLOSED                     │
+    └── REJECTED                   └── REJECTED                   │
+                                                               publish answer
+                                                                    │
+                                                                    v
+                                                               ANSWERED ──> CLOSED
 ```
-SUBMITTED ──(structure)──→ IN_REVIEW ──(transition)──→ UNDER_DISCUSSION
-    │                         │                             │
-    ├──→ CLOSED               ├──→ CLOSED               (publish_answer)
-    └──→ REJECTED             └──→ REJECTED                 │
-                                                        ANSWERED ──→ CLOSED
-```
 
-Two transitions are implicit — they happen as side effects of domain actions, not through the `/transition/` endpoint:
-- `SUBMITTED → IN_REVIEW` only happens when a moderator structures the case
-- `UNDER_DISCUSSION → ANSWERED` only happens when a moderator publishes an answer
+Two transitions are tied to specific actions:
 
-I did this because these transitions are tightly coupled to specific data changes. You can't be IN_REVIEW without a `structured_summary`. You can't be ANSWERED without a `PublishedAnswer` record. Forcing them through the generic transition endpoint would mean validating those preconditions in two places.
+- `SUBMITTED` to `IN_REVIEW` happens when a moderator structures the case.
+- `UNDER_DISCUSSION` to `ANSWERED` happens when a moderator publishes the answer.
 
-The valid transitions live in a `VALID_TRANSITIONS` dict in services.py. The `transition_case()` function checks it. There's no way to reach a state without going through the service layer, and the service layer won't let you skip steps.
+I did not expose these as generic status changes because the status depends on related data. A case should not become `IN_REVIEW` without a structured summary, and it should not become `ANSWERED` without a published answer.
 
-## Core Architecture Trade-offs
+The allowed transitions are defined in `VALID_TRANSITIONS` inside `services.py`, and all status changes go through the service layer.
 
-### 1. Concurrency — what happens when two moderators act on the same case?
+## Main Design Decisions
 
-I use optimistic locking. The `Case` model has a `version` integer. Every state-changing request must include `expected_version`. The update does:
+### 1. Concurrency handling
+
+I used optimistic locking for case updates.
+
+Each case has a `version` integer. When a moderator updates a case, the request includes `expected_version`. The update only succeeds if the current version matches.
 
 ```python
-updated = Case.objects.filter(id=case_id, version=expected_version).update(
-    status=new_status, version=F('version') + 1, ...
+updated = Case.objects.filter(
+    id=case_id,
+    version=expected_version,
+).update(
+    status=new_status,
+    version=F("version") + 1,
 )
+
 if updated == 0:
     raise StaleVersionError()
 ```
 
-This is a database-level compare-and-swap. If two moderators read version 3 and both try to update, exactly one succeeds. The other gets a 409 Conflict with a `STALE_VERSION` error code. The client must re-fetch and retry.
+This works like a compare-and-swap at the database level. If two moderators read version 3 and both submit changes, only one update will succeed. The other user gets a 409 Conflict and has to re-fetch the latest case.
 
-For comment creation, I also use `select_for_update()` (pessimistic lock) because comments assign sequential anonymous numbers and I need that to be serialized within a transaction.
+I did not use pessimistic locking for all case updates because review work can take time. Holding a database lock while someone reads the case and writes a summary is not practical.
 
-**What I rejected:** Pure pessimistic locking everywhere. Clinical review sessions can last minutes or hours. Holding a database row lock while a moderator reads through a case, types a summary, and hits submit is a non-starter — it blocks everyone else and risks deadlocks if the connection drops. Optimistic locking pushes the conflict to the moment of write, which is the right tradeoff for a system where reads vastly outnumber writes.
+For comment creation, I used `select_for_update()` because anonymous numbers have to be assigned in order within the same case. That small part needs to be serialized.
 
-**What breaks:** Under genuinely high contention (many moderators all acting on the same case simultaneously), you'd see a lot of 409s and forced retries. In practice, tumor boards have maybe 2-3 moderators and cases are worked on sequentially, so this is fine. If it became a real problem, I'd add exponential backoff on the client side.
+### 2. Anonymous comments and reveal behaviour
 
-### 2. Anonymity reveal — the snapshot problem
+The main privacy issue was this: if a doctor posts anonymously and later reveals their identity, what should happen to replies and quotes that already showed them as anonymous?
 
-A doctor posts anonymously as "Anonymous Doctor #2". Other doctors reply to it, quote it. Then Doctor #2 wants to reveal their identity on that one comment. What happens to all the replies that say "in response to Anonymous Doctor #2"?
+I decided not to update old replies and quotes. They keep the display name snapshot from the time they were created.
 
-My answer: nothing happens to them. They stay frozen.
+So if a reply says it was responding to “Anonymous Doctor #2”, it continues to show that even after the original comment is revealed. Only the revealed comment itself starts showing the real name.
 
-When a comment is created, I snapshot the parent's display name into `parent_display_name_snapshot` and the quoted comment's display name into `quoted_display_name_snapshot`. These are plain strings, written once, never updated. When Doctor #2 reveals, I flip `is_revealed=True` on their comment. Their own `get_display_name()` now returns their real name. But every reply that already recorded "Anonymous Doctor #2" keeps showing that — because it's a stored string, not a computed reference.
+This avoids a consent problem. Revealing identity on one comment should not automatically expose the doctor in older quoted or replied contexts.
 
-**What I rejected:** Computing display names dynamically by walking up the comment tree. This sounds cleaner (no denormalized data!) but it means revealing your identity on one comment retroactively changes how you appear in replies and quotes you never consented to being identified in. A doctor might be willing to reveal on their own comment but not want their name attached to a heated sub-thread three levels deep. Frozen snapshots respect that boundary.
+The tradeoff is that snapshots are denormalized strings. If we ever need to rebuild the whole thread display from current data, these snapshots will not automatically follow the latest state. For this project, that tradeoff is acceptable.
 
-**What I gave up:** If we ever need to rebuild or re-render old comment trees, the snapshot approach makes that harder. The snapshots are just strings — they don't link back to the original comment's current state. An event sourcing approach for the comment thread would be more flexible but was overkill for this scope.
+### 3. Anonymity vs accountability
 
-### 3. Anonymity vs. audit — hidden to peers, known to system
+The system always stores the real author of a comment. Anonymity is only about what is shown to other users.
 
-The `author` foreign key is always stored on every comment. That never changes. Anonymity is purely a presentation-layer concern.
+Doctors see comments through `CommentPeerSerializer`. This serializer does not include `author`, `author_id`, email, or username.
 
-I enforce it with two separate serializer classes:
-- `CommentPeerSerializer` — returns `display_name` (computed), `content`, timestamps, snapshot fields. No `author`, no `author_id`, no email. Doctors see this.
-- `CommentAccountabilitySerializer` — inherits from peer, adds `author` and `author_username`. Moderators see this.
+Moderators use `CommentAccountabilitySerializer`, which includes author information.
 
-The view picks the serializer based on `request.user.role`. There's no conditional field hiding on a single serializer — that's fragile and easy to mess up. Two separate classes means a code reviewer can look at `CommentPeerSerializer` and confirm the `author` field simply doesn't exist on it.
+I used two serializers instead of one serializer with conditional field removal. Conditional field hiding is easy to break later. With two serializers, it is clearer what each role can see.
 
-**Where leaks could happen:** Error responses. If a doctor triggers a validation error on a comment and the error body includes the object's ID or author field in the traceback, that's a leak. I wrote a custom exception handler (`config/exceptions.py`) that strips `author`, `author_id`, `author_username`, `email`, and `profile` keys from all error response bodies before sending them. There's a test for this: `test_error_bodies_do_not_contain_author_id`.
+I also added a custom exception handler in `config/exceptions.py`. It removes sensitive keys like `author`, `author_id`, `author_username`, `email`, and `profile` from error responses. This is to avoid leaking identity through validation errors.
 
-**Another leak vector:** Sequential IDs. If comment IDs were integers, you could infer ordering and narrow down who posted when. All primary keys are UUIDs — random, non-sequential, unguessable.
+All primary keys are UUIDs, so users cannot guess records by trying sequential IDs.
 
-### 4. Auditability without bloat
+### 4. Audit logging
 
-Nine event types: `CASE_STRUCTURED`, `CASE_TRANSITION`, `DOCTOR_INVITED`, `COMMENT_CREATED`, `IDENTITY_REVEALED`, `ANSWER_PUBLISHED`, `ANSWER_AMENDED`, `CASE_CLOSED`, `CASE_REJECTED`. Each stores a JSON `metadata` field with context (old status, new status, version numbers, etc.).
+Audit logging is done through explicit service calls. I did not use middleware that logs every request because that creates too much noise. GET requests, Swagger requests, and health checks are not useful audit records.
 
-I draw the line at clinically meaningful writes. A moderator viewing a case? Not audited. A moderator transitioning it? Audited. A doctor reading comments? Not audited. A doctor posting a comment? Audited. GET requests create zero audit events — I have a test (`test_ordinary_get_does_not_create_audit_event`) that verifies this.
+The audit events cover actions such as:
 
-**What I rejected:** Django middleware that logs every HTTP request. I tried this early on and it generated hundreds of records per session — mostly GETs from Swagger UI, health checks, and static file requests. Finding the one clinically relevant action in that noise would be terrible for a compliance reviewer. Explicit audit calls in the service layer means every audit record is a deliberate, meaningful entry.
+- case structured
+- case status changed
+- doctor invited
+- comment created
+- identity revealed
+- answer published
+- answer amended
+- case closed
+- case rejected
 
-**Another rejected option:** Django signals on model `post_save`. The problem is signals fire on any save — including internal updates, migrations, management commands. They also make it hard to include context (who did this? what was the previous state?) because the signal only gets the model instance, not the request or the business operation that triggered it. Explicit calls let me pass `actor`, `case`, `metadata` with full context.
+Each event stores metadata like old status, new status, version numbers, or other context.
 
-**Cost I accepted:** If a future developer adds a new state-changing action to `services.py` and forgets to call `create_audit_event()`, that action goes unaudited. I mitigated this by keeping all business logic in one file — so there's exactly one place to look.
+The limitation is that if a future developer adds a new write operation and forgets to create an audit event, that operation may go unaudited. I reduced this risk by keeping business logic in one service file, so it is easier to review.
 
-### 5. Edit after publish — what's immutable?
+### 5. Immutability after publishing
 
-Once a case reaches `ANSWERED`:
-- The `PublishedAnswer` record cannot be updated. The model's `save()` raises `ValidationError` if you try to update an existing row. This is enforced at the ORM level — it doesn't trust the view or service layer to prevent it.
-- Comment content is locked. `Comment.save()` checks if the case is `ANSWERED` and rejects content changes. But `is_revealed` changes are still allowed — revealing your identity isn't editing clinical content.
-- Amendments go through `AmendedAnswer` — a separate model with a `version_number` and a mandatory `reason` field. You can't silently change what was published. You can only add a new amendment that says "version 2, changed because X".
+After a case reaches `ANSWERED`, clinical content should not be silently changed.
 
-I enforced immutability at three layers: model `save()` overrides, service-layer status checks, and view-layer permission checks. Any one of those could be bypassed in isolation (a developer could call `PublishedAnswer.objects.filter(...).update(content=...)` and skip the `save()` override). But all three together make accidental mutation unlikely. The `save()` override is the last line of defense.
+The rules are:
 
-**What I rejected:** A single `Answer` model with a `versions` JSONField. Simpler schema, but you lose the ability to query individual amendment versions, and a JSONField full of past versions is hard to index and hard to inspect in Django admin. Separate models are more verbose but each amendment is a first-class record.
+- `PublishedAnswer` cannot be updated after creation.
+- Comment content cannot be changed after the case is answered.
+- Identity reveal is still allowed because it is not changing clinical content.
+- Any change to the final answer must be added as an `AmendedAnswer` with a reason.
 
-### 6. Real-time — honestly scoped
+This is enforced in the model layer and also checked in the service/view layer. It is not impossible for a developer to bypass this using direct queryset updates, but normal application code will not accidentally mutate the published record.
 
-I didn't build it. Here's how I'd do it.
+### 6. Real-time discussion
 
-Django Channels with a Redis channel layer. One WebSocket group per case: `case_{uuid}_discussion`. On connection, validate the JWT and check that the doctor has an accepted invitation for that case. Reject unauthorized connections at the handshake.
+I did not implement real-time WebSockets in this version.
 
-When a new comment is created, broadcast a minimal notification: `{"type": "new_comment", "comment_id": "uuid"}`. The client then fetches the full comment via the REST endpoint. I would not broadcast the comment content over the WebSocket — that bypasses the serializer layer and its anonymity protections.
+If I had more time, I would add Django Channels with Redis. Each case would have a WebSocket group like `case_<uuid>_discussion`. On connection, the server would validate the JWT and check whether the doctor is invited to that case.
 
-**What breaks first at 50 doctors:** Not the WebSocket broadcast — Redis pub/sub handles that easily. The problem is 50 clients all hitting `GET /api/cases/{id}/comments/` simultaneously after receiving the notification. That's 50 database queries in a spike. Mitigation: cache the comment list with a short TTL (5-10 seconds), or have the REST endpoint return only the single new comment by ID instead of the full list.
+When a new comment is created, I would broadcast only a small event like:
 
-## Key Decisions and Rejected Alternatives
+```json
+{"type": "new_comment", "comment_id": "uuid"}
+```
 
-| Decision | What I picked | What I rejected | Why |
-|----------|--------------|----------------|-----|
-| Business logic location | `services.py` (7 functions) | Fat models / view logic | Domain operations span multiple models; one file to audit |
-| Concurrency control | Optimistic locking (version field) | `select_for_update` everywhere | Reviews are long-lived; holding DB locks for minutes is bad |
-| Anonymity storage | Separate serializer classes | Conditional field inclusion on one serializer | Two classes = easier to review, harder to accidentally leak |
-| Audit mechanism | Explicit `create_audit_event()` calls | Middleware / Django signals | Signals are implicit; middleware logs noise; explicit = reliable |
-| Answer immutability | `save()` override + separate AmendedAnswer model | Versioned JSONField on single model | Separate records are queryable, inspectable, first-class |
-| Comment threading | Adjacency list (parent FK) | MPTT / closure table | Simple enough for tumor boards; deep nesting unlikely |
-| Primary keys | UUIDs everywhere | Auto-incrementing integers | Prevents enumeration; clinical data shouldn't be guessable |
-| Invitation flow | Auto-accept | Accept/decline workflow | Scope cut; real accept/decline adds UI complexity with low clinical value for MVP |
-| Error body handling | Custom exception handler that strips identity fields | Default DRF errors | Default errors can leak author info in validation messages |
+The client would then fetch the full comment through the REST API. I would avoid sending full comment content over WebSocket because the REST serializer already handles the anonymity rules.
+
+At around 50 doctors, the main issue would not be Redis broadcast. The issue would be many clients fetching the comment list at the same time. A short cache or fetching only the new comment by ID would help.
+
+## Rejected Alternatives
+
+| Area | Chosen approach | Rejected approach | Reason |
+|------|-----------------|------------------|--------|
+| Business logic | Service layer | Fat models or views | Operations span multiple models and need transactions |
+| Audit logging | Explicit audit calls | Signals or middleware | Easier to review and less noisy |
+| Concurrency | Optimistic locking | Locking rows for long periods | Review work can take time |
+| Comment privacy | Separate serializers | Conditional fields in one serializer | Less chance of leaking author data |
+| Answer changes | Separate amendments | Updating the same answer record | Original answer should stay intact |
+| Comment tree | Parent FK | MPTT/closure table | Deep nesting is unlikely here |
+| IDs | UUIDs | Auto-increment IDs | Avoid enumeration |
+| Invitation flow | Auto-accept | Accept/decline workflow | Kept MVP simpler |
+| Error handling | Custom sanitizer | Default DRF error response only | Reduces accidental identity leaks |
 
 ## Security and Data Integrity
 
-I'm not claiming HIPAA compliance. But here's what I'm thinking about:
+This is not a claim of full healthcare compliance, but I added some basic protections:
 
-- **No leaking through errors**: The custom exception handler in `config/exceptions.py` walks every error response body and strips keys like `author`, `author_id`, `author_username`, `email`. A validation error that says "this author already voted" could leak who the author is — the sanitizer catches that before it reaches the client.
-- **Unguessable IDs**: Every model uses UUID primary keys. You can't crawl `/api/cases/1/`, `/api/cases/2/` looking for cases you're not invited to.
-- **Token rotation**: JWT access tokens expire in 15 minutes. Refresh tokens last 1 day, and on refresh the old token is blacklisted and a new one is issued. A stolen refresh token is usable exactly once.
-- **Double permission checks**: Checked once in the view (DRF permission classes) and again in the service layer (role checks, invitation checks). If someone bypasses the view layer, the service still catches it.
-- **Audit records survive**: `AuditEvent.save()` rejects updates. `AuditEvent.delete()` raises exceptions. The Django admin for audit is registered as read-only. A rogue admin can't quietly erase evidence of a state change.
+- UUID primary keys for all main records.
+- JWT access tokens expire in 15 minutes.
+- Refresh tokens rotate and old refresh tokens are blacklisted.
+- Permission checks happen in views and also in service functions.
+- Error responses are sanitized to remove identity-related fields.
+- Audit events cannot be updated or deleted through normal model/admin usage.
 
-**What I'd add with more time:** Request-level rate limiting on public endpoints (token obtain, token refresh). Right now a brute-force attack on the login endpoint is not throttled. `ALLOWED_HOSTS` in production settings is set to `['*']` — that needs to be locked down to actual deployment domains.
+Things I would still improve:
 
-## Self-Critique — Two Weakest Parts
+- Add rate limiting for login and token refresh endpoints.
+- Lock down `ALLOWED_HOSTS` properly for production.
+- Add more dedicated tests for authentication.
+- Add coverage reporting to find untested branches.
 
-### 1. Zero tests for the accounts/auth app
+## Weak Parts / Self Review
 
-The `apps/accounts/` directory has no test files at all. The JWT token lifecycle — obtaining tokens, refreshing, blacklisting expired refresh tokens, handling invalid credentials — is completely untested. The auth endpoints work (the E2E test uses them), but there are no dedicated unit tests covering edge cases like expired tokens, malformed headers, or duplicate email registration.
+### 1. Accounts app tests are missing
 
-This matters because auth is the perimeter of the system. If the JWT validation silently fails or the blacklist doesn't work, every other permission check downstream is meaningless.
+The accounts app does not have proper dedicated tests. The E2E flow covers login indirectly, but there are no focused tests for invalid credentials, token refresh, token rotation, duplicate registration, or malformed auth headers.
 
-**How I'd fix it:** Add `apps/accounts/tests/test_auth.py` with tests for: valid login returns access + refresh, invalid password returns 401, expired access token returns 401, refresh token rotation blacklists the old token, and duplicate email registration returns 400. Maybe 8-10 tests, most of them fast to write.
+This is a gap because authentication is the entry point of the system. I would add a separate `apps/accounts/tests/test_auth.py` file for these cases.
 
-### 2. No test coverage measurement and the E2E test lives outside pytest
+### 2. No coverage report yet
 
-I have 64 passing tests and decent coverage of the domain logic, but I have no actual coverage report. I don't know what percentage of `services.py` or `views.py` is exercised. There are likely dead code paths in serializers that no test touches.
+There are passing tests for the domain logic, but I did not add coverage measurement. So I cannot say exactly how much of `services.py`, serializers, or views are covered.
 
-The E2E test (`e2e_api_test.py`) is a standalone script that runs with `python e2e_api_test.py`, not integrated into the pytest suite. This means `pytest` doesn't run it, CI wouldn't catch it breaking, and it doesn't contribute to any coverage metrics.
+I would add `pytest-cov`, configure it in `pytest.ini`, and run:
 
-**How I'd fix it:** Add `pytest-cov` to test requirements, configure it in `pytest.ini`, run `pytest --cov=apps --cov-report=term-missing` to see exactly what's uncovered. Convert the E2E script into a proper pytest test class so it runs with everything else. Target 85%+ line coverage on `services.py` specifically — that's where the logic lives, that's where bugs hide.
+```bash
+pytest --cov=apps --cov-report=term-missing
+```
 
-## How I Used AI on This
+The E2E script should also be converted into a pytest test so it runs with the rest of the suite.
 
-I used an AI coding assistant throughout the project. Here's what actually happened.
+## How I Used AI
 
-I used Claude extensively for this project.
+I used Claude during the project, mainly to speed up repetitive work.
 
-For the repetitive stuff, it was great. I had it scaffold the initial project layout, write the CRUD serializers, generate the factory-boy test fixtures, and handle the boilerplate JWT configuration.
+It helped with project scaffolding, serializers, some test setup, factory fixtures, and boilerplate configuration. That saved time.
 
-But for the core domain logic, it fought me a bit. 
+For the main design decisions, I had to change or reject a few AI suggestions. For example, the first suggestion was to put state validation in model `save()` or `clean()`. I moved it to the service layer because the operation needs actor context, version checks, audit metadata, and transactions.
 
-For instance, the AI's first instinct was to put the state machine validation inside the model's `clean()` and `save()` methods. That doesn't work here because `save()` doesn't have access to the actor, the expected version, or the context needed for audit events. I moved all of it to the service layer so I could wrap the transition, audit event, and version check in one atomic transaction. 
+For anonymous comments, the initial approach was conditional field removal in one serializer. I changed it to two serializers because that is safer to review.
 
-For the anonymity feature, its initial solution was a single serializer with a conditional `if user.role == 'doctor': fields.remove('author')`. I rejected that because conditional field removal is fragile and one bad edit away from a leak. I forced it to use two separate serializer classes instead.
+The audit logging also started as middleware-based logging, but that produced too many low-value records. I replaced it with explicit audit calls from the service layer.
 
-It also generated a middleware-based audit logger at first. I tried it, realized it was logging hundreds of noise records (GET requests, static files) with no clinical context, threw it out, and wrote the explicit audit service calls myself.
+I also chose the snapshot approach for anonymous display names because cascading identity reveal through old replies felt wrong from a consent point of view.
 
-I also had to design the snapshot approach for the anonymity reveal. The AI kept suggesting cascading updates where revealing identity would recursively propagate through all replies. I realized that violated user consent (revealing on your own comment shouldn't expose you in quotes you didn't write), so I implemented the frozen snapshot pattern. 
-
-Ultimately, the AI wrote about 60% of the raw code, mostly in tests and boilerplate. But the architecture—especially the concurrency locking, audit philosophy, and security hardening—were decisions I made and implemented manually when the AI's default suggestions fell short.
+So overall, AI helped with speed and boilerplate, but the concurrency, audit, privacy, and immutability decisions were reviewed and adjusted manually.
