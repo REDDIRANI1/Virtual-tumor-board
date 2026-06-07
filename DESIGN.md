@@ -79,16 +79,14 @@ User
 
 The case statuses move like this:
 
-```text
 SUBMITTED ── structure case ──> IN_REVIEW ── transition ──> UNDER_DISCUSSION
-    │                              │                              │
-    ├── CLOSED                     ├── CLOSED                     │
-    └── REJECTED                   └── REJECTED                   │
-                                                               publish answer
-                                                                    │
-                                                                    v
-                                                               ANSWERED ──> CLOSED
-```
+│ │ │
+├── CLOSED ├── CLOSED │
+└── REJECTED └── REJECTED │
+publish answer
+│
+v
+ANSWERED ──> CLOSED
 
 Two transitions are tied to specific actions:
 
@@ -189,12 +187,12 @@ This is enforced in the model layer and also checked in the service/view layer. 
 
 I did not implement real-time WebSockets in this version.
 
-If I had more time, I would add Django Channels with Redis. Each case would have a WebSocket group like `case_<uuid>_discussion`. On connection, the server would validate the JWT and check whether the doctor is invited to that case.
+If I had more time, I would add Django Channels with Redis. h case would have a WebSocket group like `case_<uuid>_discussion`. On connection, the server would validate the JWT and check whether the doctor is invited to that case.
 
 When a new comment is created, I would broadcast only a small event like:
 
 ```json
-{"type": "new_comment", "comment_id": "uuid"}
+{ "type": "new_comment", "comment_id": "uuid" }
 ```
 
 The client would then fetch the full comment through the REST API. I would avoid sending full comment content over WebSocket because the REST serializer already handles the anonymity rules.
@@ -203,17 +201,17 @@ At around 50 doctors, the main issue would not be Redis broadcast. The issue wou
 
 ## Rejected Alternatives
 
-| Area | Chosen approach | Rejected approach | Reason |
-|------|-----------------|------------------|--------|
-| Business logic | Service layer | Fat models or views | Operations span multiple models and need transactions |
-| Audit logging | Explicit audit calls | Signals or middleware | Easier to review and less noisy |
-| Concurrency | Optimistic locking | Locking rows for long periods | Review work can take time |
-| Comment privacy | Separate serializers | Conditional fields in one serializer | Less chance of leaking author data |
-| Answer changes | Separate amendments | Updating the same answer record | Original answer should stay intact |
-| Comment tree | Parent FK | MPTT/closure table | Deep nesting is unlikely here |
-| IDs | UUIDs | Auto-increment IDs | Avoid enumeration |
-| Invitation flow | Auto-accept | Accept/decline workflow | Kept MVP simpler |
-| Error handling | Custom sanitizer | Default DRF error response only | Reduces accidental identity leaks |
+| Area            | Chosen approach      | Rejected approach                    | Reason                                                |
+| --------------- | -------------------- | ------------------------------------ | ----------------------------------------------------- |
+| Business logic  | Service layer        | Fat models or views                  | Operations span multiple models and need transactions |
+| Audit logging   | Explicit audit calls | Signals or middleware                | Easier to review and less noisy                       |
+| Concurrency     | Optimistic locking   | Locking rows for long periods        | Review work can take time                             |
+| Comment privacy | Separate serializers | Conditional fields in one serializer | Less chance of leaking author data                    |
+| Answer changes  | Separate amendments  | Updating the same answer record      | Original answer should stay intact                    |
+| Comment tree    | Parent FK            | MPTT/closure table                   | Deep nesting is unlikely here                         |
+| IDs             | UUIDs                | Auto-increment IDs                   | Avoid enumeration                                     |
+| Invitation flow | Auto-accept          | Accept/decline workflow              | Kept MVP simpler                                      |
+| Error handling  | Custom sanitizer     | Default DRF error response only      | Reduces accidental identity leaks                     |
 
 ## Security and Data Integrity
 

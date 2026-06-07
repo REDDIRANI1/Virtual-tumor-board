@@ -82,4 +82,33 @@ pytest -v --tb=short
 - [DESIGN.md](./DESIGN.md): Contains the architecture overview, concurrency strategies, anonymity implementation, and responses to the assessment's hard questions.
 
 ## Walkthrough Video
-[Link to Walkthrough Video (Placeholder) - To be recorded prior to submission]
+
+**[Watch the walkthrough (5–8 min)]https://drive.google.com/file/d/143qpezohFVW6KWLavDSXa5TvtGCMTjSV/view?usp=drive_link**
+
+### Demo credentials (fake data only)
+
+| Role | Username | Password |
+|------|----------|----------|
+| Warrior | `warrior_jane` | `Password123!` |
+| Moderator | `mod_smith` | `Password123!` |
+| Doctor | `doc_jones` | `Password123!` |
+| Admin | `admin` | `Password123!` |
+
+### Quick demo commands
+
+```bash
+# Seed a full case lifecycle
+python manage.py seed_demo_data
+
+# Run tests
+pip install -r requirements/test.txt
+pytest -v --tb=short
+
+# Get JWT (moderator)
+curl -X POST http://localhost:8000/api/auth/token/ \
+  -H "Content-Type: application/json" \
+  -d '{"username":"mod_smith","password":"Password123!"}'
+
+# List cases (use token from above)
+curl http://localhost:8000/api/cases/ -H "Authorization: Bearer <access>"
+```
